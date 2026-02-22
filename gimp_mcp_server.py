@@ -2,78 +2,182 @@
 # GIMP MCP Server Script
 # Provides an MCP interface to control GIMP via a socket connection.
 
-from mcp.server.fastmcp import FastMCP, Context, Image  # Adjust based on your MCP library
-import socket
 import json
-import logging
+import socket
 import base64
 import traceback
+import logging
+import os
 from pathlib import Path
+from typing import Optional, Any
+from mcp.server.fastmcp import (
+    FastMCP,
+    Context,
+    Image,
+)
+from mcp.server.stdio import stdio_server
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("GimpMCPServer")
+logger.debug("Debug logging enabled")
+
+
+# GIMP Connection Configuration
+GIMP_HOST = os.environ.get("GIMP_MCP_HOST", "localhost")
+GIMP_PORT = int(os.environ.get("GIMP_MCP_PORT", "9878"))
+CONNECTION_TIMEOUT = float(os.environ.get("GIMP_MCP_TIMEOUT", "30.0"))
+
+
+class GimpConnectionError(Exception):
+    """Exception raised when connection to GIMP fails."""
+
+    pass
+
 
 class GimpConnection:
-    def __init__(self, host='localhost', port=9877):
+    """Manages the socket connection to the GIMP MCP plugin."""
+
+    _instance: Optional["GimpConnection"] = None
+
+    def __init__(
+        self,
+        host: str = GIMP_HOST,
+        port: int = GIMP_PORT,
+        timeout: float = CONNECTION_TIMEOUT,
+    ):
         self.host = host
         self.port = port
-        self.sock = None
+        self.timeout = timeout
+        self._socket: Optional[socket.socket] = None
 
-    def connect(self):
-        if self.sock:
-            return
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to GIMP at {self.host}:{self.port}")
-        except Exception as e:
-            logger.error(f"Failed to connect: {e}")
-            raise ConnectionError("Could not connect to GIMP. Ensure the MCP Server plugin is running.")
+    @classmethod
+    def get_instance(cls) -> "GimpConnection":
+        """Get or create a singleton connection instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
-    def send_command(self, command_type, params=None):
-        if not self.sock:
-            self.connect()
-        command = {"type": command_type, "params": params or {"args": []}}
+    def connect(self) -> socket.socket:
+        """Establish a connection to the GIMP plugin."""
+        if self._socket is not None:
+            try:
+                # Test if socket is still alive
+                self._socket.send(b"")
+                return self._socket
+            except (OSError, socket.error):
+                self._socket = None
+
         try:
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            
-            # Receive response in chunks for large data
-            response_data = b''
+            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._socket.settimeout(self.timeout)
+            self._socket.connect((self.host, self.port))
+            logger.debug(f"Connected to GIMP at {self.host}:{self.port}")
+            return self._socket
+        except socket.error as e:
+            self._socket = None
+            raise GimpConnectionError(
+                f"Failed to connect to GIMP plugin at {self.host}:{self.port}. "
+                f"Make sure GIMP is running and the MCP server is started (Tools > Start MCP Server). "
+                f"Error: {e}"
+            )
+
+    def disconnect(self) -> None:
+        """Close the connection to GIMP."""
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except (OSError, socket.error):
+                pass
+            finally:
+                self._socket = None
+
+    def send_command(self, command_type: str, params: Optional[dict] = None) -> dict:
+        """Send a command to GIMP and return the response.
+
+        Args:
+            command_type: The type of command to send (e.g., 'get_image_bitmap', 'exec')
+            params: Optional parameters for the command
+
+        Returns:
+            dict: The response from GIMP
+
+        Raises:
+            GimpConnectionError: If connection or communication fails
+        """
+        if params is None:
+            params = {}
+
+        # Build the command JSON
+        command = {"type": command_type, **params}
+        command_json = json.dumps(command)
+
+        try:
+            sock = self.connect()
+
+            # Send the command
+            sock.sendall(command_json.encode("utf-8"))
+            logger.debug(f"Sent command: {command_type}")
+
+            # Receive the response
+            response_data = b""
             while True:
-                chunk = self.sock.recv(8192)
-                if not chunk:
-                    break
-                response_data += chunk
-                
-                # Try to parse as complete JSON
                 try:
-                    json.loads(response_data.decode('utf-8'))
-                    break  # Complete JSON received
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue  # Need more data
-                    
-            self.sock = None
-            return json.loads(response_data.decode('utf-8'))
-        except Exception as e:
-            logger.error(f"Communication error: {e}")
-            self.sock = None
-            raise Exception(f"Error communicating with GIMP: {e}")
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+                    response_data += chunk
 
-# Global connection
-_gimp_connection = None
+                    # Try to parse as JSON to check if complete
+                    try:
+                        json.loads(response_data.decode("utf-8"))
+                        break  # Complete JSON received
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue  # Keep receiving
+                except socket.timeout:
+                    break
 
-def get_gimp_connection():
-    global _gimp_connection
-    if _gimp_connection is None:
-        _gimp_connection = GimpConnection()
-        _gimp_connection.connect()
-    return _gimp_connection
+            if not response_data:
+                raise GimpConnectionError("No response received from GIMP")
 
-# MCP server
-mcp = FastMCP("GimpMCP", description="GIMP integration through MCP")
+            response_str = response_data.decode("utf-8")
+            response = json.loads(response_str)
+
+            logger.debug(f"Received response: {response.get('status', 'unknown')}")
+            return response
+
+        except socket.timeout:
+            self.disconnect()
+            raise GimpConnectionError(
+                f"Connection to GIMP timed out after {self.timeout} seconds. "
+                "The operation may be taking too long or GIMP may be unresponsive."
+            )
+        except json.JSONDecodeError as e:
+            self.disconnect()
+            raise GimpConnectionError(f"Invalid JSON response from GIMP: {e}")
+        except socket.error as e:
+            self.disconnect()
+            raise GimpConnectionError(f"Socket error communicating with GIMP: {e}")
+
+
+def get_gimp_connection() -> GimpConnection:
+    """Get the GIMP connection singleton."""
+    return GimpConnection.get_instance()
+
+
+# Using stdio for communication in MCP server mode
+
+mcp = FastMCP("GimpMCP")
+
 
 @mcp.tool()
-def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int | None = None, region: dict | None = None) -> Image:
+def get_image_bitmap(
+    ctx: Context,
+    max_width: int | None = None,
+    max_height: int | None = None,
+    region: dict | None = None,
+) -> Image:
     """Get the current open image in GIMP as an Image object with optional scaling and region selection.
 
     PRIMARY USE: Verification tool for checking work mid-workflow, not just final delivery.
@@ -125,11 +229,10 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
     - RuntimeError if no image is open, region is invalid, or export fails
     """
     try:
-
         print("Requesting current image bitmap from GIMP...")
 
         conn = get_gimp_connection()
-        
+
         # Build parameters for the bitmap request
         params = {}
         if max_width is not None:
@@ -138,10 +241,10 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
             params["max_height"] = max_height
         if region is not None:
             params["region"] = region
-            
+
         result = conn.send_command("get_image_bitmap", params)
         if result["status"] == "success":
-            # Extract the base64 image data 
+            # Extract the base64 image data
             image_info = result["results"]
             base64_data = image_info["image_data"]
 
@@ -159,24 +262,24 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
 @mcp.tool()
 def get_image_metadata(ctx: Context) -> dict:
     """Get metadata about the current open image in GIMP without the bitmap data.
-    
+
     Returns detailed information about the currently active image including:
     - Image dimensions (width, height)
     - Color mode and base type
     - Number of layers and channels
     - File information if available
     - Layer structure and properties
-    
+
     This is much faster than get_image_bitmap() since it doesn't export the actual image data.
     Perfect for when you only need to know image properties for decision making.
-    
+
     Returns:
     - Dictionary containing comprehensive image metadata
     - Raises exception if no images are open
     """
     try:
         print("Requesting current image metadata from GIMP...")
-        
+
         conn = get_gimp_connection()
         result = conn.send_command("get_image_metadata")
         if result["status"] == "success":
@@ -220,6 +323,7 @@ def get_gimp_info(ctx: Context) -> dict:
         traceback.print_exc()
         raise Exception(f"Failed to get GIMP info: {e}")
 
+
 @mcp.tool()
 def get_context_state(ctx: Context) -> dict:
     """Get the current GIMP context state (colors, brush, settings).
@@ -258,87 +362,856 @@ def get_context_state(ctx: Context) -> dict:
 
 
 @mcp.tool()
-def call_api(ctx: Context, api_path: str, args: list = [], kwargs: dict = {}) -> str:
+def call_api(ctx: Context, api_path: str, args: list) -> str:
     """Call GIMP 3.0 API methods through PyGObject console.
 
-    GIMP MCP Protocol:
-    - Use api_path="exec" to execute Python code in GIMP
-    - args[0] should be "pyGObject-console" for executing commands
-    - args[1] should be array of Python code strings to execute
-    - Commands execute in persistent context - imports and variables persist
-    - Always call Gimp.displays_flush() after drawing operations
-
-    For image operations, use get_image_bitmap()
-    which return proper MCP Image objects that Claude can process directly.
-
-    GUIDANCE PROMPTS:
-    - For common operations and best practices, invoke the 'gimp_best_practices' prompt
-    - For complex multi-element drawings with layers, invoke the 'gimp_iterative_workflow' prompt
-
-    Optional Initialization Pattern:
-    ["images = Gimp.get_images()", "image1 = images[0]",
-     "layers = image1.get_layers()", "layer1 = layers[0]", "drawable1 = layer1"]
-
-    Common Operations:
-    - Draw line: ["Gimp.pencil(drawable1, [0, 0, 200, 200])", "Gimp.displays_flush()"]
-    - Set color: ["from gi.repository import Gegl", "red_color = Gegl.Color.new('red')", 
-                  "Gimp.context_set_foreground(red_color)"]
-    - Draw ellipse: ["Gimp.Image.select_ellipse(image1, Gimp.ChannelOps.REPLACE, 100, 100, 30, 20)",
-                     "Gimp.Drawable.edit_fill(drawable1, Gimp.FillType.FOREGROUND)",
-                     "Gimp.Selection.none(image1)", "Gimp.displays_flush()"]
-    - Paint curve: ["Gimp.paintbrush_default(drawable1, [50.0, 50.0, 150.0, 200.0, 250.0, 50.0, 350.0, 200.0])", 
-                    "Gimp.displays_flush()"]
-    - Draw bezier curve: ["path = Gimp.Path.new(image1, 'my_bezier_path')", 
-                          "image1.insert_path(path, None, 0)",
-                          "stroke_id = path.bezier_stroke_new_moveto(100, 100)",
-                          "path.bezier_stroke_cubicto(stroke_id, 150, 50, 250, 150, 300, 100)",
-                          "Gimp.Drawable.edit_stroke_item(drawable1, path)",
-                          "Gimp.Selection.none(image1)", "Gimp.displays_flush()"]
-    - Get open filenames: ["print([x.get_file().get_path() for x in Gimp.get_images()])"]
-    - Copy layer between images: ["image1 = Gimp.get_images()[0]", "image2 = Gimp.get_images()[1]",
-                                  "width = image1.get_width()", "height = image1.get_height()",
-                                  "image1.select_rectangle(Gimp.ChannelOps.REPLACE, 0, 0, width, height)",
-                                  "image1_layers = image1.get_selected_layers()", "drawable = image1_layers[0]",
-                                  "Gimp.edit_copy([drawable])", "image2_layers = image2.get_layers()",
-                                  "target_drawable = image2_layers[0]", "floating_sel = Gimp.edit_paste(target_drawable, True)[0]",
-                                  "Gimp.floating_sel_anchor(floating_sel)", "Gimp.displays_flush()"]
-    - New image: ["image1 = Gimp.Image.new(350, 800, Gimp.ImageBaseType.RGB)",
-                  "layer1 = Gimp.Layer.new(image1, 'Background', 350, 800, Gimp.ImageType.RGB_IMAGE, 100, Gimp.LayerMode.NORMAL)",
-                  "image1.insert_layer(layer1, None, 0)", "drawable1 = layer1",
-                  "white_color = Gegl.Color.new('white')", "Gimp.context_set_background(white_color)",
-                  "Gimp.Drawable.edit_fill(drawable1, Gimp.FillType.BACKGROUND)", "Gimp.Display.new(image1)"]
-    
-    Important Tips:
-    - When filling layers with color, ensure layer has alpha channel using Gimp.Layer.add_alpha()
-    - Use Gimp.Drawable.fill() for reliable full-layer fills
-    - Specify colors precisely with rgb(R, G, B) or rgba(R, G, B, A) to avoid transparency issues
-    - After drawing operations, always call Gimp.displays_flush()
-    - After selection operations for drawing, unselect with Gimp.Selection.none(image1)
-
-    GIMP 3.0 API Changes:
-    - Use Gimp.get_images() instead of deprecated Gimp.list_images()
-    - Use image.get_layers() instead of Gimp.get_active_layer()
-    - gimpfu module not available in GIMP 3.0
-    - Colors created with Gegl.Color.new('color_name')
-    - Full API documentation: https://developer.gimp.org/api/3.0/libgimp/
+    This tool sends Python commands to GIMP for execution in its Python-Fu console.
 
     Parameters:
-    - api_path: Use "exec" for Python execution
-    - args: ["pyGObject-console", ["python_code_array"]] or ["pyGObject-eval", ["expression"]]
-    - kwargs: Dictionary of keyword arguments (rarely used)
+    - api_path: Use "exec" for Python execution.
+    - args: ["pyGObject-console", ["python_code_array"]]
+
+    Example:
+    ```json
+    {
+        "tool_name": "call_api",
+        "arguments": {
+            "api_path": "exec",
+            "args": ["pyGObject-console", [
+                "image = Gimp.Image.new(800, 600, Gimp.ImageBaseType.RGB)",
+                "layer = Gimp.Layer.new(image, 'Background', 800, 600, Gimp.ImageType.RGB_IMAGE, 100, Gimp.LayerMode.NORMAL)",
+                "image.insert_layer(layer, None, 0)",
+                "Gimp.Display.new(image)",
+                "Gimp.displays_flush()"
+            ]]
+        }
+    }
+    ```
 
     Returns:
-    - JSON string of the result or error message
+    - JSON string of the result or error message.
     """
     try:
         conn = get_gimp_connection()
-        result = conn.send_command("call_api", {"api_path": api_path, "args": args, "kwargs": kwargs})
+
+        # Build the command based on args format
+        # The plugin expects either:
+        # - {"cmds": [list of python commands]}
+        # - {"type": "call_api", "params": {"args": [...]}}
+        if args and len(args) >= 2:
+            # Format: ["pyGObject-console", ["command1", "command2", ...]]
+            cmds = args[1] if isinstance(args[1], list) else [args[1]]
+            result = conn.send_command("exec", {"cmds": cmds})
+        else:
+            result = conn.send_command("exec", {"cmds": args})
+
         if result["status"] == "success":
             return json.dumps(result["results"])
         else:
-            return f"Error: {json.dumps(result["error"])}"
+            return json.dumps({"error": result.get("error", "Unknown error")})
+    except GimpConnectionError as e:
+        return json.dumps({"error": str(e)})
     except Exception as e:
-        return f"Error: {e}"
+        traceback.print_exc()
+        return json.dumps({"error": f"Failed to call API: {e}"})
+
+
+@mcp.tool()
+def ping(ctx: Context) -> dict:
+    """Check if GIMP MCP plugin is running and responsive.
+
+    This tool sends a simple ping to verify the connection to GIMP is working.
+    Use this to diagnose connection issues or verify GIMP is ready.
+
+    Returns:
+    - Dictionary with connection status and latency information
+    """
+    try:
+        conn = get_gimp_connection()
+        import time
+
+        start = time.time()
+        result = conn.send_command("get_gimp_info")
+        latency = time.time() - start
+
+        return {
+            "status": "connected",
+            "latency_seconds": round(latency, 3),
+            "gimp_version": result.get("results", {})
+            .get("version", {})
+            .get("detected_version", "unknown"),
+            "host": conn.host,
+            "port": conn.port,
+        }
+    except GimpConnectionError as e:
+        return {
+            "status": "disconnected",
+            "error": str(e),
+            "host": GIMP_HOST,
+            "port": GIMP_PORT,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def disconnect(ctx: Context) -> dict:
+    """Disconnect from the GIMP plugin.
+
+    This tool explicitly closes the socket connection to GIMP.
+    Use this when you want to force a fresh connection on the next operation,
+    or when you're done working with GIMP.
+
+    Returns:
+    - Dictionary with disconnection status
+    """
+    try:
+        conn = get_gimp_connection()
+        conn.disconnect()
+        return {
+            "status": "disconnected",
+            "message": "Successfully disconnected from GIMP",
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def exec_python(ctx: Context, code: str | list[str]) -> dict:
+    """Execute Python code directly in GIMP's Python-Fu console.
+
+    This is the primary tool for running GIMP API commands. Code executes
+    in a persistent context - imports and variables persist between calls.
+
+    Parameters:
+    - code: A single Python statement or list of statements to execute.
+            Can be a string (single line or multiline) or array of strings.
+
+    Examples:
+    - Single statement: exec_python("print('Hello from GIMP')")
+    - Multiple statements: exec_python(["from gi.repository import Gimp", "images = Gimp.get_images()"])
+    - Initialize context: exec_python(["images = Gimp.get_images()", "image = images[0]", "drawable = image.get_layers()[0]"])
+
+    Returns:
+    - Dictionary with 'status' and 'results' (array of outputs) or 'error'
+    """
+    try:
+        conn = get_gimp_connection()
+
+        # Normalize code to always be a list
+        if isinstance(code, str):
+            cmds = [code]
+        else:
+            cmds = code
+
+        result = conn.send_command("exec", {"cmds": cmds})
+        return result
+    except GimpConnectionError as e:
+        return {"status": "error", "error": str(e)}
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": f"Failed to execute code: {e}"}
+
+
+@mcp.tool()
+def create_image(
+    ctx: Context,
+    width: int,
+    height: int,
+    name: str = "Untitled",
+    image_type: str = "RGB",
+    fill_with: str = "white",
+) -> dict:
+    """Create a new image in GIMP.
+
+    Parameters:
+    - width: Image width in pixels
+    - height: Image height in pixels
+    - name: Image name (default: "Untitled")
+    - image_type: Color mode - "RGB", "GRAY", or "INDEXED" (default: "RGB")
+    - fill_with: Fill color - "white", "black", "transparent", or color name (default: "white")
+
+    Returns:
+    - Dictionary with status and image info (index, dimensions)
+
+    Example:
+    - create_image(width=800, height=600, name="My Art", fill_with="white")
+    - create_image(width=1920, height=1080, fill_with="transparent")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        # Build type mapping
+        type_map = {
+            "RGB": "Gimp.ImageBaseType.RGB",
+            "GRAY": "Gimp.ImageBaseType.GRAY",
+            "GRAYSCALE": "Gimp.ImageBaseType.GRAY",
+            "INDEXED": "Gimp.ImageBaseType.INDEXED",
+        }
+        gimp_type = type_map.get(image_type.upper(), "Gimp.ImageBaseType.RGB")
+
+        # Build fill command
+        if fill_with.lower() == "transparent":
+            fill_cmd = f"""Gimp.Drawable.edit_fill(layer, Gimp.FillType.TRANSPARENT)"""
+        elif fill_with.lower() == "black":
+            fill_cmd = f"""color = Gegl.Color.new('black')
+Gimp.context_set_background(color)
+Gimp.Drawable.edit_fill(layer, Gimp.FillType.BACKGROUND)"""
+        else:
+            fill_cmd = f"""color = Gegl.Color.new('{fill_with}')
+Gimp.context_set_background(color)
+Gimp.Drawable.edit_fill(layer, Gimp.FillType.BACKGROUND)"""
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl, Gio",
+            f"image = Gimp.Image.new({width}, {height}, {gimp_type})",
+            f"layer = Gimp.Layer.new(image, 'Background', {width}, {height}, Gimp.ImageType.RGBA_IMAGE, 100, Gimp.LayerMode.NORMAL)",
+            "image.insert_layer(layer, None, 0)",
+            fill_cmd,
+            "Gimp.Display.new(image)",
+            "Gimp.displays_flush()",
+        ]
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Created new {width}x{height} image",
+                "image": {
+                    "width": width,
+                    "height": height,
+                    "name": name,
+                    "type": image_type,
+                },
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def create_layer(
+    ctx: Context,
+    name: str,
+    width: int | None = None,
+    height: int | None = None,
+    opacity: float = 100.0,
+    layer_mode: str = "NORMAL",
+) -> dict:
+    """Create a new layer in the current image.
+
+    Parameters:
+    - name: Layer name
+    - width: Layer width (default: same as image)
+    - height: Layer height (default: same as image)
+    - opacity: Layer opacity 0-100 (default: 100)
+    - layer_mode: Blend mode - "NORMAL", "MULTIPLY", "SCREEN", "OVERLAY", etc. (default: "NORMAL")
+
+    Returns:
+    - Dictionary with status and layer info
+
+    Example:
+    - create_layer("Details")  # Full-size layer
+    - create_layer("Overlay", opacity=50, layer_mode="OVERLAY")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        # Build dimensions
+        width_cmd = "width" if width is None else str(width)
+        height_cmd = "height" if height is None else str(height)
+
+        mode_map = {
+            "NORMAL": "Gimp.LayerMode.NORMAL",
+            "MULTIPLY": "Gimp.LayerMode.MULTIPLY",
+            "SCREEN": "Gimp.LayerMode.SCREEN",
+            "OVERLAY": "Gimp.LayerMode.OVERLAY",
+            "DARKEN": "Gimp.LayerMode.DARKEN_ONLY",
+            "LIGHTEN": "Gimp.LayerMode.LIGHTEN_ONLY",
+            "COLOR_DODGE": "Gimp.LayerMode.DODGE",
+            "COLOR_BURN": "Gimp.LayerMode.BURN",
+            "HARD_LIGHT": "Gimp.LayerMode.HARD_LIGHT",
+            "SOFT_LIGHT": "Gimp.LayerMode.SOFT_LIGHT",
+            "DIFFERENCE": "Gimp.LayerMode.DIFFERENCE",
+            "ADDITION": "Gimp.LayerMode.ADDITION",
+            "SUBTRACT": "Gimp.LayerMode.SUBTRACT",
+        }
+        gimp_mode = mode_map.get(layer_mode.upper(), "Gimp.LayerMode.NORMAL")
+
+        cmds = [
+            "from gi.repository import Gimp",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            "width = image.get_width()",
+            "height = image.get_height()",
+            f"layer = Gimp.Layer.new(image, '{name}', {width_cmd}, {height_cmd}, Gimp.ImageType.RGBA_IMAGE, {opacity}, {gimp_mode})",
+            "image.insert_layer(layer, None, 0)",
+            "Gimp.displays_flush()",
+        ]
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Created layer '{name}'",
+                "layer": {"name": name, "opacity": opacity, "mode": layer_mode},
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def set_color(
+    ctx: Context, foreground: str | None = None, background: str | None = None
+) -> dict:
+    """Set foreground and/or background colors in GIMP.
+
+    Parameters:
+    - foreground: Foreground color (name like "red", hex like "#ff0000", or rgb like "rgb(1,0,0)")
+    - background: Background color (same formats)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - set_color(foreground="red")
+    - set_color(foreground="#ff0000", background="white")
+    - set_color(foreground="rgb(1, 0.5, 0)")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = ["from gi.repository import Gimp, Gegl"]
+
+        if foreground:
+            cmds.append(f"fg_color = Gegl.Color.new('{foreground}')")
+            cmds.append("Gimp.context_set_foreground(fg_color)")
+
+        if background:
+            cmds.append(f"bg_color = Gegl.Color.new('{background}')")
+            cmds.append("Gimp.context_set_background(bg_color)")
+
+        if len(cmds) == 1:
+            return {"status": "error", "error": "No colors specified"}
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Set colors - foreground: {foreground}, background: {background}",
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def draw_line(
+    ctx: Context,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    brush_size: float = 2.0,
+    color: str | None = None,
+) -> dict:
+    """Draw a line on the current layer.
+
+    Parameters:
+    - x1, y1: Start point coordinates
+    - x2, y2: End point coordinates
+    - brush_size: Line thickness in pixels (default: 2.0)
+    - color: Optional color (if set, changes foreground color)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - draw_line(0, 0, 100, 100)  # Diagonal line
+    - draw_line(50, 50, 200, 50, brush_size=5, color="red")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            "layers = image.get_layers()",
+            "if not layers: raise Exception('No layers in image')",
+            "drawable = layers[0]",
+            f"Gimp.context_set_brush_size({brush_size})",
+        ]
+
+        if color:
+            cmds.append(f"Gimp.context_set_foreground(Gegl.Color.new('{color}'))")
+
+        cmds.extend(
+            [
+                f"Gimp.pencil(drawable, [{x1}, {y1}, {x2}, {y2}])",
+                "Gimp.displays_flush()",
+            ]
+        )
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Drew line from ({x1},{y1}) to ({x2},{y2})",
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def draw_rectangle(
+    ctx: Context,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    fill: bool = True,
+    color: str | None = None,
+    stroke: bool = False,
+    stroke_color: str | None = None,
+    stroke_width: float = 1.0,
+) -> dict:
+    """Draw a rectangle on the current layer.
+
+    Parameters:
+    - x, y: Top-left corner position
+    - width, height: Rectangle dimensions
+    - fill: Whether to fill the rectangle (default: True)
+    - color: Fill color (default: current foreground)
+    - stroke: Whether to stroke the outline (default: False)
+    - stroke_color: Stroke color (default: current foreground)
+    - stroke_width: Stroke thickness (default: 1.0)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - draw_rectangle(50, 50, 200, 100, color="blue")
+    - draw_rectangle(0, 0, 300, 200, fill=False, stroke=True, stroke_color="black")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            "layers = image.get_layers()",
+            "if not layers: raise Exception('No layers in image')",
+            "drawable = layers[0]",
+            f"Gimp.Image.select_rectangle(image, Gimp.ChannelOps.REPLACE, {x}, {y}, {width}, {height})",
+        ]
+
+        if fill:
+            if color:
+                cmds.append(f"Gimp.context_set_foreground(Gegl.Color.new('{color}'))")
+            cmds.append("Gimp.Drawable.edit_fill(drawable, Gimp.FillType.FOREGROUND)")
+
+        if stroke:
+            if stroke_color:
+                cmds.append(
+                    f"Gimp.context_set_foreground(Gegl.Color.new('{stroke_color}'))"
+                )
+            cmds.append(f"Gimp.context_set_brush_size({stroke_width})")
+            cmds.append("Gimp.Drawable.edit_stroke(drawable)")
+
+        cmds.extend(
+            [
+                "Gimp.Selection.none(image)",
+                "Gimp.displays_flush()",
+            ]
+        )
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Drew rectangle at ({x},{y}) size {width}x{height}",
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def draw_ellipse(
+    ctx: Context,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    fill: bool = True,
+    color: str | None = None,
+    stroke: bool = False,
+    stroke_color: str | None = None,
+    stroke_width: float = 1.0,
+) -> dict:
+    """Draw an ellipse (or circle) on the current layer.
+
+    Parameters:
+    - x, y: Top-left corner of bounding box
+    - width, height: Ellipse dimensions (use same values for circle)
+    - fill: Whether to fill the ellipse (default: True)
+    - color: Fill color (default: current foreground)
+    - stroke: Whether to stroke the outline (default: False)
+    - stroke_color: Stroke color (default: current foreground)
+    - stroke_width: Stroke thickness (default: 1.0)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - draw_ellipse(100, 100, 50, 50, color="red")  # Filled circle
+    - draw_ellipse(0, 0, 200, 100, fill=False, stroke=True)  # Ellipse outline
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            "layers = image.get_layers()",
+            "if not layers: raise Exception('No layers in image')",
+            "drawable = layers[0]",
+            f"Gimp.Image.select_ellipse(image, Gimp.ChannelOps.REPLACE, {x}, {y}, {width}, {height})",
+        ]
+
+        if fill:
+            if color:
+                cmds.append(f"Gimp.context_set_foreground(Gegl.Color.new('{color}'))")
+            cmds.append("Gimp.Drawable.edit_fill(drawable, Gimp.FillType.FOREGROUND)")
+
+        if stroke:
+            if stroke_color:
+                cmds.append(
+                    f"Gimp.context_set_foreground(Gegl.Color.new('{stroke_color}'))"
+                )
+            cmds.append(f"Gimp.context_set_brush_size({stroke_width})")
+            cmds.append("Gimp.Drawable.edit_stroke(drawable)")
+
+        cmds.extend(
+            [
+                "Gimp.Selection.none(image)",
+                "Gimp.displays_flush()",
+            ]
+        )
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Drew ellipse at ({x},{y}) size {width}x{height}",
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def draw_text(
+    ctx: Context,
+    text: str,
+    x: int,
+    y: int,
+    font_size: float = 18,
+    font_name: str = "Sans",
+    color: str | None = None,
+) -> dict:
+    """Draw text on the current image.
+
+    Parameters:
+    - text: The text to draw
+    - x, y: Position coordinates
+    - font_size: Font size in points (default: 18)
+    - font_name: Font family name (default: "Sans")
+    - color: Text color (default: current foreground)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - draw_text("Hello World", 50, 100, font_size=24, color="black")
+    - draw_text("Title", 10, 10, font_size=36, font_name="Arial")
+    """
+    try:
+        conn = get_gimp_connection()
+
+        # Escape single quotes in text
+        escaped_text = text.replace("'", "\\'")
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl, Pango",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+        ]
+
+        if color:
+            cmds.append(f"Gimp.context_set_foreground(Gegl.Color.new('{color}'))")
+
+        cmds.extend(
+            [
+                f"text_layer = Gimp.TextLayer.new(image, '{escaped_text}', None, {font_size}, {x}, {y})",
+                f"text_layer.set_font('{font_name}')",
+                "image.insert_layer(text_layer, None, 0)",
+                "Gimp.displays_flush()",
+            ]
+        )
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {"status": "success", "message": f"Drew text '{text}' at ({x},{y})"}
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def apply_filter(ctx: Context, filter_name: str, layer_index: int = 0) -> dict:
+    """Apply a filter/effect to a layer.
+
+    Parameters:
+    - filter_name: Name of the filter to apply. Common filters:
+      - "blur-gaussian": Gaussian blur
+      - "blur-motion": Motion blur
+      - "edge-sobel": Sobel edge detection
+      - "noise-rgb": RGB noise
+      - "enhance-sharpen": Sharpen
+      - "distort-ripple": Ripple effect
+    - layer_index: Index of layer to apply filter to (default: 0 = top layer)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - apply_filter("blur-gaussian")
+    - apply_filter("edge-sobel", layer_index=1)
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = [
+            "from gi.repository import Gimp, Gegl",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            f"layers = image.get_layers()",
+            f"if len(layers) <= {layer_index}: raise Exception('Layer index out of range')",
+            f"drawable = layers[{layer_index}]",
+        ]
+
+        # Map common filter names to GIMP procedure names
+        filter_map = {
+            "blur-gaussian": (
+                "gegl:gaussian-blur",
+                {"std-dev-x": 5.0, "std-dev-y": 5.0},
+            ),
+            "blur-motion": ("gegl:motion-blur", {"length": 10, "angle": 45}),
+            "edge-sobel": ("gegl:edge-sobel", {}),
+            "noise-rgb": ("gegl:noise-rgb", {"seed": 0}),
+            "enhance-sharpen": ("gegl:unsharp-mask", {"std-dev": 5.0, "scale": 0.5}),
+            "distort-ripple": ("gegl:ripple", {}),
+            "pixelize": ("gegl:pixelize", {"size-x": 8, "size-y": 8}),
+        }
+
+        if filter_name.lower() not in filter_map:
+            available = ", ".join(filter_map.keys())
+            return {
+                "status": "error",
+                "error": f"Unknown filter '{filter_name}'. Available: {available}",
+            }
+
+        gegl_op, params = filter_map[filter_name.lower()]
+
+        # Build GEGL operation
+        param_str = ", ".join(f'"{k}": {v}' for k, v in params.items())
+        if param_str:
+            param_str = f", {{{param_str}}}"
+
+        cmds.extend(
+            [
+                f'Gimp.Drawable.filter(drawable, "{gegl_op}"{param_str})',
+                "Gimp.displays_flush()",
+            ]
+        )
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Applied filter '{filter_name}' to layer {layer_index}",
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def undo(ctx: Context, steps: int = 1) -> dict:
+    """Undo the last operation(s) in GIMP.
+
+    Parameters:
+    - steps: Number of operations to undo (default: 1)
+
+    Returns:
+    - Dictionary with status
+
+    Example:
+    - undo()  # Undo last operation
+    - undo(steps=3)  # Undo last 3 operations
+    """
+    try:
+        conn = get_gimp_connection()
+
+        cmds = [
+            "from gi.repository import Gimp",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+        ]
+
+        for _ in range(steps):
+            cmds.append("image.undo()")
+
+        cmds.append("Gimp.displays_flush()")
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {"status": "success", "message": f"Undid {steps} operation(s)"}
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
+
+@mcp.tool()
+def save_image(
+    ctx: Context,
+    filepath: str,
+    format: str = "PNG",
+    quality: int = 90,
+    layer_index: int | None = None,
+) -> dict:
+    """Save the current image to a file.
+
+    Parameters:
+    - filepath: Full path where to save the file
+    - format: Export format - "PNG", "JPEG", "BMP", "TIFF" (default: "PNG")
+    - quality: Quality for JPEG (1-100, default: 90)
+    - layer_index: Specific layer to export (default: None = all visible layers merged)
+
+    Returns:
+    - Dictionary with status and file info
+
+    Example:
+    - save_image("/home/user/output.png")
+    - save_image("/home/user/photo.jpg", format="JPEG", quality=85)
+    """
+    try:
+        conn = get_gimp_connection()
+
+        # Escape backslashes for Windows paths
+        escaped_path = filepath.replace("\\", "\\\\")
+
+        format_upper = format.upper()
+
+        cmds = [
+            "from gi.repository import Gimp, Gio",
+            "images = Gimp.get_images()",
+            "if not images: raise Exception('No images open')",
+            "image = images[0]",
+            f'file = Gio.File.new_for_path("{escaped_path}")',
+        ]
+
+        if layer_index is not None:
+            cmds.extend(
+                [
+                    f"layers = image.get_layers()",
+                    f"if len(layers) <= {layer_index}: raise Exception('Layer index out of range')",
+                    f"drawable = layers[{layer_index}]",
+                ]
+            )
+        else:
+            cmds.append("drawable = image.get_active_layer()")
+
+        if format_upper == "PNG":
+            cmds.extend(
+                [
+                    'proc = Gimp.get_pdb().lookup_procedure("file-png-export")',
+                    "config = proc.create_config()",
+                    "config.set_property('image', image)",
+                    "config.set_property('file', file)",
+                    "config.set_property('drawable', drawable)",
+                    "proc.run(config)",
+                ]
+            )
+        elif format_upper == "JPEG":
+            cmds.extend(
+                [
+                    'proc = Gimp.get_pdb().lookup_procedure("file-jpeg-export")',
+                    "config = proc.create_config()",
+                    "config.set_property('image', image)",
+                    "config.set_property('file', file)",
+                    "config.set_property('drawable', drawable)",
+                    f"config.set_property('quality', {quality / 100.0})",
+                    "proc.run(config)",
+                ]
+            )
+        else:
+            # Generic file save
+            cmds.extend(
+                [
+                    f"Gimp.file_save(Gimp.RunMode.NONINTERACTIVE, image, file)",
+                ]
+            )
+
+        cmds.append("Gimp.displays_flush()")
+
+        result = conn.send_command("exec", {"cmds": cmds})
+
+        if result["status"] == "success":
+            return {
+                "status": "success",
+                "message": f"Saved image to {filepath}",
+                "file": filepath,
+                "format": format,
+            }
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "error", "error": str(e)}
+
 
 @mcp.prompt(
     description="GIMP MCP best practices for common operations - filling shapes, bezier paths, and variable persistence"
@@ -351,6 +1224,7 @@ def gimp_best_practices() -> str:
     """
     docs_path = Path(__file__).parent / "docs" / "best_practices.md"
     return docs_path.read_text()
+
 
 @mcp.prompt(
     description="Iterative workflow guidance for building complex images with proper validation and layer management"
@@ -368,8 +1242,11 @@ def gimp_iterative_workflow() -> str:
     docs_path = Path(__file__).parent / "docs" / "iterative_workflow.md"
     return docs_path.read_text()
 
+
 def main():
-    mcp.run()
+    # Use stdio_server for reliable local connections
+    stdio_server(mcp)
+
 
 if __name__ == "__main__":
     main()
