@@ -5,10 +5,12 @@ Provides mock objects for GIMP API to enable testing without GIMP installation.
 
 import sys
 from unittest.mock import MagicMock, Mock
+from pathlib import Path
 
 
 class MockGimpImageBaseType:
     """Mock for Gimp.ImageBaseType enum."""
+
     RGB = 0
     GRAY = 1
     INDEXED = 2
@@ -16,11 +18,13 @@ class MockGimpImageBaseType:
 
 class MockGimpLayerMode:
     """Mock for Gimp.LayerMode enum."""
+
     NORMAL = 0
 
 
 class MockGimpPrecision:
     """Mock for Gimp.Precision enum."""
+
     U8_LINEAR = 100
     U8_GAMMA = 150
     U16_LINEAR = 200
@@ -37,6 +41,7 @@ class MockGimpPrecision:
 
 class MockGimpLayer:
     """Mock for GIMP Layer object."""
+
     def __init__(self):
         self.get_name = Mock(return_value="Test Layer")
         self.get_width = Mock(return_value=1920)
@@ -48,6 +53,7 @@ class MockGimpLayer:
 
 class MockGimpImage:
     """Mock for GIMP Image object."""
+
     def __init__(self):
         self.get_width = Mock(return_value=1920)
         self.get_height = Mock(return_value=1080)
@@ -67,6 +73,7 @@ class MockGimpImage:
 
 class MockGimpSelection:
     """Mock for Gimp.Selection static methods."""
+
     @staticmethod
     def none(image):
         return None
@@ -74,45 +81,48 @@ class MockGimpSelection:
 
 class MockGimpPlugin:
     """Mock for Gimp.PlugIn base class."""
+
     __gtype__ = Mock()  # Make it a class attribute, not instance
-    
+
     def __init__(self):
         pass
 
+
 class MockGimp:
     """Mock for main Gimp module."""
+
     ImageBaseType = MockGimpImageBaseType
     LayerMode = MockGimpLayerMode
     Precision = MockGimpPrecision
     Selection = MockGimpSelection
     PlugIn = MockGimpPlugin  # Add PlugIn class for inheritance
-    
+
     @staticmethod
     def get_images():
         return [MockGimpImage()]
-    
+
     @staticmethod
     def main(plugin_type, args):
         pass
-    
+
     class Image:
         @staticmethod
         def new(width, height, base_type):
             return MockGimpImage()
-    
+
     class Layer:
         @staticmethod
         def new(image, name, width, height, layer_type, opacity, mode):
             return MockGimpLayer()
-    
+
     @staticmethod
     def edit_copy(layers):
         return None
-    
+
     @staticmethod
     def edit_paste(layer, paste_into):
         return [MockGimpLayer()]
-    
+
     @staticmethod
     def floating_sel_anchor(selection):
         return None
@@ -120,12 +130,12 @@ class MockGimp:
 
 class MockGi:
     """Mock for gi module."""
-    
+
     @staticmethod
     def require_version(module, version):
         """Mock gi.require_version() - does nothing in tests."""
         pass
-    
+
     class repository:
         Gimp = MockGimp
         GLib = Mock()  # Mock GLib dependency
@@ -135,21 +145,17 @@ def setup_gimp_mocks():
     """Set up GIMP mocks in sys.modules to enable plugin import."""
     # Mock gi module
     gi_mock = MockGi()
-    sys.modules['gi'] = gi_mock
-    sys.modules['gi.repository'] = gi_mock.repository
-    sys.modules['gi.repository.Gimp'] = MockGimp
-    
+    sys.modules["gi"] = gi_mock
+    sys.modules["gi.repository"] = gi_mock.repository
+    sys.modules["gi.repository.Gimp"] = MockGimp
+
     return gi_mock
 
 
 def cleanup_gimp_mocks():
     """Clean up GIMP mocks from sys.modules."""
-    modules_to_remove = [
-        'gi',
-        'gi.repository', 
-        'gi.repository.Gimp'
-    ]
-    
+    modules_to_remove = ["gi", "gi.repository", "gi.repository.Gimp"]
+
     for module in modules_to_remove:
         if module in sys.modules:
             del sys.modules[module]
@@ -178,19 +184,20 @@ def setup_scaled_mock(width=200, height=150):
 def create_mock_plugin():
     """Create a mock MCPPlugin instance with mocked GIMP dependencies."""
     setup_gimp_mocks()
-    
+
     # Import plugin module with dash handling
     import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "gimp_mcp_plugin", 
-        "/home/fred/dev/gimp-mcp/gimp-mcp-plugin.py"
-    )
+
+    # Get the correct path relative to this file
+    plugin_path = Path(__file__).parent.parent / "gimp-mcp-plugin.py"
+
+    spec = importlib.util.spec_from_file_location("gimp_mcp_plugin", str(plugin_path))
     module = importlib.util.module_from_spec(spec)
-    
+
     # Prevent Gimp.main execution during import
     original_main = MockGimp.main
     MockGimp.main = lambda *args: None
-    
+
     try:
         spec.loader.exec_module(module)
         plugin = module.MCPPlugin()

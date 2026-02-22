@@ -6,3 +6,12 @@
 
 # macOS
 .DS_Store
+
+# Windows
+nul
+*.bat
+
+# Screenshots and temp files
+*.png
+!docs/images/*.png
+gimp-screenshot*.png
