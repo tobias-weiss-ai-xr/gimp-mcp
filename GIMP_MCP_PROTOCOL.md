@@ -448,6 +448,47 @@ gimp_info = get_gimp_info()
 - **`get_image_metadata()`**: When you need image properties for decision making, validation, or information display
 - **`get_gimp_info()`**: When you need environment information for troubleshooting, capability detection, or optimal support
 
+## GEGL Filter Tools
+### Tools overview
+- `list_gegl_filters(filter_type=None)`: Discover available GEGL filters.
+- `apply_gegl_filter(filter_name, parameters)`: Apply a GEGL filter to the active image.
+- `preview_gegl_filter(filter_name, parameters)`: Generate a preview of the filter applied to the active image.
+
+### Parameters and returns
+- list_gegl_filters(filter_type=None)
+  - Parameters: filter_type (string, optional)
+  - Returns: array of filter descriptors: { name, type, description, parameters_schema }
+- apply_gegl_filter(filter_name, parameters)
+  - Parameters: filter_name (string, required), parameters (object, required)
+  - Returns: Image object representing updated active image
+- preview_gegl_filter(filter_name, parameters)
+  - Parameters: filter_name (string, required), parameters (object, required)
+  - Returns: Image object representing preview image
+
+### Error Handling
+- Structured error responses with fields: error_code, message, details
+- Example error: { "error": { "code": "invalid_parameter", "message": "Invalid parameter", "details": "radius must be >= 0" } }
+
+### Examples (MCP client)
+```json
+{
+  "api_path": "exec",
+  "args": ["pyGObject-console", ["list_gegl_filters()"]]
+}
+```
+```json
+{
+  "api_path": "exec",
+  "args": ["pyGObject-console", ["apply_gegl_filter('gaussian-blur', {'radius': 5})"]]
+}
+```
+```json
+{
+  "api_path": "exec",
+  "args": ["pyGObject-console", ["preview_gegl_filter('edge-detect', {'threshold': 1.5})"]]
+}
+```
+
 ## Plugin Architecture
 
 ### Connection Protocol
@@ -475,3 +516,69 @@ gimp_info = get_gimp_info()
 - Batch process images
 - Create custom GIMP tools and filters
 - Debug GIMP Python scripts
+## GEGL Filter Tools
+
+The GIMP MCP server provides tools for discovering and applying GEGL filters:
+
+### `list_gegl_filters(filter_type=None)`
+Discover available GEGL filters with optional category filtering.
+- **Parameters**:
+  - `filter_type` (string, optional): Filter by category (e.g., "blur", "color").
+- **Returns**: List of filter descriptors, each containing:
+  - `name`: Filter name (string).
+  - `description`: Filter description (string).
+  - `category`: Filter category (string).
+  - `parameters`: List of parameter descriptors.
+
+### `apply_gegl_filter(filter_name, parameters)`
+Apply a GEGL filter to the active image.
+- **Parameters**:
+  - `filter_name` (string, required): Name of the filter to apply.
+  - `parameters` (object, required): Key-value pairs of parameter names and values.
+- **Returns**: Updated active image as an MCP-compliant Image object.
+
+### `preview_gegl_filter(filter_name, parameters)`
+Generate a preview of a GEGL filter applied to the active image.
+- **Parameters**:
+  - `filter_name` (string, required): Name of the filter to preview.
+  - `parameters` (object, required): Key-value pairs of parameter names and values.
+- **Returns**: Preview image as an MCP-compliant Image object (base64-encoded PNG).
+
+### Error Handling
+Structured error responses for invalid parameters, missing filters, or runtime errors:
+```json
+{
+  "status": "error",
+  "error": "Invalid parameter 'radius': must be a float between 0.0 and 100.0",
+  "details": {
+    "available_filters": ["gaussian_blur", "colorize"],
+    "parameter_suggestions": {"radius": {"type": "float", "constraints": "0.0-100.0"}}
+  }
+}
+```
+
+### Examples (MCP Client Payloads)
+
+List available filters:
+```json
+{
+  "api_path": "exec",
+  "args": ["list_gegl_filters()"]
+}
+```
+
+Apply a Gaussian blur with radius 5:
+```json
+{
+  "api_path": "exec",
+  "args": ["apply_gegl_filter('gaussian_blur', {'radius': 5})"]
+}
+```
+
+Preview an edge-detect filter with threshold 1.5:
+```json
+{
+  "api_path": "exec",
+  "args": ["preview_gegl_filter('edge_detect', {'threshold': 1.5})"]
+}
+```

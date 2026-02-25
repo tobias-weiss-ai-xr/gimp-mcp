@@ -338,6 +338,22 @@ We welcome contributions! Here are some areas for improvement:
 - **🌐 Remote Access**: Support for network-accessible GIMP instances
 - **📊 Analytics**: Usage metrics and performance monitoring
 
+### 🎨 GEGL Filter Tools
+- **`list_gegl_filters(filter_type=None)`**: Discover available GEGL filters.
+- **`apply_gegl_filter(filter_name, parameters)`**: Apply a GEGL filter to the active image.
+- **`preview_gegl_filter(filter_name, parameters)`**: Generate a preview of the filter applied to the active image.
+
+#### Examples
+```markdown
+# List available GEGL filters
+list_gegl_filters()
+
+# Apply a Gaussian blur with radius 5
+apply_gegl_filter("gaussian-blur", {"radius": 5})
+
+# Preview an edge-detection filter with a threshold
+preview_gegl_filter("edge-detect", {"threshold": 1.5})
+```
 ## Contributing
 
 Contributions are welcome! Whether it's bug fixes, new features, or documentation improvements, feel free to submit a Pull Request or open an issue.

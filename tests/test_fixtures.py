@@ -54,7 +54,7 @@ class MockGimpLayer:
 class MockGimpImage:
     """Mock for GIMP Image object."""
 
-    def __init__(self):
+    def __init__(self, gimp=None):
         self.get_width = Mock(return_value=1920)
         self.get_height = Mock(return_value=1080)
         self.get_base_type = Mock(return_value=MockGimpImageBaseType.RGB)
@@ -69,6 +69,86 @@ class MockGimpImage:
         self.insert_layer = Mock(return_value=None)
         self.scale = Mock(return_value=None)
         self.delete = Mock(return_value=None)
+
+    def apply_filter(self, filter_name, parameters):
+        """Mock applying a GEGL-like filter with parameter validation."""
+        meta_list = MockGimp.list_gegl_operations()
+        op = next((f for f in meta_list if f.get("name") == filter_name), None)
+        if op is None:
+            raise ValueError(
+                {
+                    "original_error": f"Unknown filter '{filter_name}'",
+                    "parameter_suggestions": [],
+                    "available_filters": [f.get("name") for f in meta_list],
+                }
+            )
+        constrained = {}
+        for param in op.get("parameters", []):
+            pname = param.get("name")
+            ptype = param.get("type")
+            if isinstance(parameters, dict) and pname in parameters:
+                value = parameters[pname]
+            else:
+                value = param.get("default")
+            # Type coercion
+            try:
+                if ptype == "float":
+                    value = float(value)
+                elif ptype == "int":
+                    value = int(value)
+                elif ptype == "string":
+                    value = str(value)
+            except Exception:
+                raise ValueError(
+                    {
+                        "original_error": f"Invalid type for {pname}: {value}",
+                        "parameter_suggestions": [
+                            {"parameter_name": pname, "type_requirements": ptype}
+                        ],
+                        "available_filters": [
+                            f.get("name") for f in MockGimp.list_gegl_operations()
+                        ],
+                    }
+                )
+            # Constraints
+            constraints = param.get("constraints")
+            if constraints:
+                try:
+                    if "-" in constraints:
+                        min_v, max_v = map(float, constraints.split("-", 1))
+                        val = float(value)
+                        if not (min_v <= val <= max_v):
+                            raise ValueError
+                except Exception:
+                    raise ValueError(
+                        {
+                            "original_error": f"Value {value} for {pname} exceeds constraint {constraints}",
+                            "parameter_suggestions": [
+                                {
+                                    "parameter_name": pname,
+                                    "value_constraints": constraints,
+                                    "type_requirements": ptype,
+                                }
+                            ],
+                            "available_filters": [
+                                f.get("name") for f in MockGimp.list_gegl_operations()
+                            ],
+                        }
+                    )
+            constrained[pname] = value
+        # Preview mode handling
+        if isinstance(parameters, dict) and parameters.get("preview") is True:
+            return {
+                "status": "preview",
+                "changed_pixels": 0,
+                "parameters": constrained,
+            }
+        return {
+            "status": "success",
+            "changed_pixels": 500,
+            "filter": filter_name,
+            "parameters": constrained,
+        }
 
 
 class MockGimpSelection:
@@ -126,6 +206,86 @@ class MockGimp:
     @staticmethod
     def floating_sel_anchor(selection):
         return None
+
+    # GEGL filters discovery and application mocks
+    @staticmethod
+    def list_gegl_operations(filter_type=None):
+        """Return a mock list of GEGL-like filter operations with parameter metadata.
+        filter_type can be used to filter by category (e.g., 'blur', 'color', 'distort', 'edge').
+        """
+        filters = [
+            {
+                "name": "gaussian_blur",
+                "description": "Soften image with blur",
+                "category": "blur",
+                "parameters": [
+                    {
+                        "name": "radius",
+                        "type": "float",
+                        "default": 5.0,
+                        "constraints": "0.0-100.0",
+                        "description": "Blur radius in pixels",
+                    }
+                ],
+            },
+            {
+                "name": "colorize",
+                "description": "Tint image with color",
+                "category": "color",
+                "parameters": [
+                    {
+                        "name": "hue",
+                        "type": "float",
+                        "default": 180.0,
+                        "constraints": "0.0-360.0",
+                        "description": "Hue adjustment in degrees",
+                    }
+                ],
+            },
+            {
+                "name": "edge_detect",
+                "description": "Detect edges",
+                "category": "detect",
+                "parameters": [
+                    {
+                        "name": "threshold",
+                        "type": "float",
+                        "default": 0.5,
+                        "constraints": "0.0-1.0",
+                        "description": "Edge detection threshold",
+                    }
+                ],
+            },
+            {
+                "name": "distort_wave",
+                "description": "Distort image with waves",
+                "category": "distort",
+                "parameters": [
+                    {
+                        "name": "amplitude",
+                        "type": "float",
+                        "default": 1.0,
+                        "constraints": "0.0-10.0",
+                        "description": "Wave amplitude",
+                    }
+                ],
+            },
+        ]
+        if filter_type:
+            ft = str(filter_type).lower()
+            return [
+                f
+                for f in filters
+                if f.get("category") == ft
+                or f.get("name") == ft
+                or ft in f.get("description", "").lower()
+            ]
+        return filters
+
+    @staticmethod
+    def list_filters(filter_type=None):
+        """Backward-compatible alias for list_gegl_operations to satisfy api discovery."""
+        return MockGimp.list_gegl_operations(filter_type=filter_type)
 
 
 class MockGi:
