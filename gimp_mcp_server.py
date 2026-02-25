@@ -25,9 +25,9 @@ logger = logging.getLogger("GimpMCPServer")
 logger.debug("Debug logging enabled")
 
 
-# Initialize FastMCP early to satisfy decorators used below during import
-
+# Initialize FastMCP
 mcp = FastMCP("GimpMCP", None)
+
 # GIMP Connection Configuration
 GIMP_HOST = os.environ.get("GIMP_MCP_HOST", "localhost")
 GIMP_PORT = int(os.environ.get("GIMP_MCP_PORT", "9878"))
@@ -284,6 +284,47 @@ def _convert_filter_parameters(raw_params: Optional[dict], filter_entry: dict) -
     return {"parameters": converted}
 
 
+def _format_error_message(
+    filter_name: str,
+    param_name: str,
+    param_info: dict | None,
+    available_filters: list,
+    filter_entry: dict,
+) -> tuple[str, dict]:
+    """Format a structured error message for invalid filter parameters.
+
+    Args:
+        filter_name: Name of the filter being applied
+        param_name: Name of the invalid parameter
+        param_info: Parameter metadata dict or None
+        available_filters: List of all available filter names
+        filter_entry: The filter's metadata entry
+
+    Returns:
+        Tuple of (error_message, details_dict)
+    """
+    if param_info:
+        ptype = param_info.get("type", "unknown")
+        constraints = param_info.get("constraints", "")
+        msg = f"Invalid parameter '{param_name}' for filter '{filter_name}': expected type {ptype}"
+        if constraints:
+            msg += f" with constraints {constraints}"
+    else:
+        msg = f"Invalid parameter '{param_name}' for filter '{filter_name}'"
+
+    details = {
+        "available_filters": [f.get("name") for f in available_filters],
+        "parameter_suggestions": {
+            p.get("name"): {
+                "type": p.get("type"),
+                "constraints": p.get("constraints"),
+            }
+            for p in (filter_entry.get("parameters") or [])
+        },
+    }
+    return msg, details
+
+
 @mcp.tool()
 def list_gegl_filters(ctx: Context, filter_type: str | None = None) -> dict:
     """Discover GEGL filters available in the current GIMP session.
@@ -331,27 +372,11 @@ def list_gegl_filters(ctx: Context, filter_type: str | None = None) -> dict:
             except Exception:
                 gegl_ops = []
 
-        # Invalidate cache if the list of available filters has changed (simple delta check)
-        try:
-            fresh_names = tuple(
-                sorted([op.get("name", "") for op in gegl_ops if isinstance(op, dict)])
-            )
-            global _filter_cache_names
-            if _filter_cache is not None and (now - _cache_timestamp) < 300:
-                if (filter_type is None and _cache_type is None) or (
-                    _cache_type == filter_type
-                ):
-                    if (
-                        _filter_cache_names is None
-                        or _filter_cache_names == fresh_names
-                    ):
-                        return _filter_cache
-                    else:
-                        _filter_cache = None
-                        _filter_cache_names = fresh_names
-        except Exception:
-            # If anything goes wrong, continue with normal discovery
-            pass
+        # Check cache hit (TTL-based) before expensive discovery
+        if _filter_cache is not None and (now - _cache_timestamp) < 300:
+            if (filter_type is None and _cache_type is None) or (_cache_type == filter_type):
+                return _filter_cache
+
 
         # Normalize to contract shape
         parsed = _parse_gegl_operations(gegl_ops)
@@ -384,17 +409,7 @@ def list_gegl_filters(ctx: Context, filter_type: str | None = None) -> dict:
             except Exception:
                 pass
 
-        # Cache hit check (TTL-based). If a cached result exists and is fresh, return it.
-        try:
-            if _filter_cache is not None:
-                if (now - _cache_timestamp) < 300:
-                    if (filter_type is None and _cache_type is None) or (
-                        _cache_type == filter_type
-                    ):
-                        return _filter_cache
-        except Exception:
-            # If anything goes wrong with the cache check, fall through to recompute
-            pass
+        # Attach default parameters for each filter
 
         # Attach a lightweight, pre-converted default parameter map for each filter
         # to aid MCP clients with typed defaults without affecting existing behavior.
@@ -697,10 +712,6 @@ def preview_gegl_filter(
 
 # Using stdio for communication in MCP server mode
 
-# Initialize FastMCP with optional server to support test environments
-# The 'server' argument is only available in production; tests import this module
-# without a live MCP server. Pass None when 'server' is not defined.
-mcp = FastMCP("GimpMCP", None)
 
 
 @mcp.tool()
@@ -1775,10 +1786,7 @@ def gimp_iterative_workflow() -> str:
     return docs_path.read_text()
 
 
-# Late-in-file guarded reinitialization to prevent redefinition of mcp
-# This block runs after all module-level initialization, ensuring that
-# if a production environment already defined 'mcp', we do not override it.
-mcp = FastMCP("GimpMCP", None)
+
 
 
 def main():
